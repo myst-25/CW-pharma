@@ -76,9 +76,9 @@ jobs:
       - name: Send APK to Telegram Group
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: '@myst2123'
-          RELEASE_URL: 'https://github.com/myst-25/CW-pharma/releases/tag/${{ env.version_tag }}'
-          REPO_URL: 'https://github.com/myst-25/CW-pharma'
+          TELEGRAM_CHAT_ID: '@myzanori'
+          RELEASE_URL: 'https://github.com/myzanori/CW-pharma/releases/tag/${{ env.version_tag }}'
+          REPO_URL: 'https://github.com/myzanori/CW-pharma'
         run: |
           echo "Verifying APK at $apk_path"
           ls -la "$apk_path"

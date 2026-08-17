@@ -41,6 +41,8 @@ com/appx/core/
 > Format: `## [YYYY-MM-DD] - Short description`
 > Then bullet list exact files changed and a one-line reason.
 
-## [2026-06-10] - Initial Map Creation
-- Created map to track both the LSPosed module codebase and the target app structure.
-
+## [2026-06-19] - IPC & UI Redesign for Module App
+- **Added `PdfDatabaseHelper` and `PdfContentProvider`**: Set up IPC so the target app's hook can securely send intercepted PDF data to the module app.
+- **Added `PdfAdapter` and redesigned `activity_main.xml`**: Transformed the module's `MainActivity` into a dashboard that lists all intercepted PDFs, allowing direct downloads.
+- **Extracted `DownloadEngine`**: Moved all OkHttp download and AES/XOR decryption logic out of `MainHook` and into a shared utility for the UI to use.
+- **Updated `MainHook`**: Replaced the UI injection logic with `syncPdfToModule()`, which silently pushes intercepted PDFs to the module's `ContentProvider`.

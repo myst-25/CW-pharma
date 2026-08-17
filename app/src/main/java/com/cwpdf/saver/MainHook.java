@@ -38,6 +38,8 @@ import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
 
+import com.cwpdf.saver.util.DownloadEngine;
+
 public class MainHook extends XposedModule {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private static final String TAG = "CWPDFSaver";
@@ -89,6 +91,7 @@ public class MainHook extends XposedModule {
                         return result;
                     }
 
+                    syncPdfToModule(activity, pdfUrl, localUri, key, title, isEncrypted);
                     injectDownloadButton(activity, pdfUrl, localUri, key, title, isEncrypted);
                     return result;
                 }
@@ -111,6 +114,8 @@ public class MainHook extends XposedModule {
                 @Override
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                     Object result = chain.proceed();
+                    if (hasShownPopup) return result; // Quick exit to save CPU
+
                     Activity activity = (Activity) chain.getThisObject();
                     
                     // Skip splash screens so the popup doesn't get destroyed when the logo disappears
@@ -119,10 +124,8 @@ public class MainHook extends XposedModule {
                         return result;
                     }
                     
-                    if (!hasShownPopup) {
-                        hasShownPopup = true;
-                        showWelcomePopup(activity);
-                    }
+                    hasShownPopup = true;
+                    showWelcomePopup(activity);
                     return result;
                 }
             };
@@ -131,192 +134,189 @@ public class MainHook extends XposedModule {
                 hook(onResumeMethod).intercept(activityOnResumeHooker);
             } catch (Throwable t) { Log.e(TAG, "Error hooking Activity.onResume", t); }
 
-            // Screenshot Bypass (FLAG_SECURE)
-            XposedInterface.Hooker windowSetFlagsHooker = new XposedInterface.Hooker() {
-                @Override
-                public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    Object[] args = chain.getArgs().toArray();
-                    if (args != null && args.length >= 2) {
-                        int flags = (int) args[0];
-                        int mask = (int) args[1];
-                        
-                        // FLAG_SECURE is 8192 (0x2000)
-                        if ((flags & android.view.WindowManager.LayoutParams.FLAG_SECURE) != 0) {
-                            Log.d(TAG, "Intercepted FLAG_SECURE, clearing it to allow screenshots.");
-                            args[0] = flags & ~android.view.WindowManager.LayoutParams.FLAG_SECURE;
-                            return chain.proceed(args);
-                        }
-                    }
-                    return chain.proceed();
-                }
-            };
+            // Crash + screenshot-block fix: the app's (void) isScreenshotEnabled()
+            // reads the current window FLAG_SECURE bit and, when the "ACTIVATE_SCREENSHOT"
+            // preference is set, dereferences a crashViewModel field that is still null
+            // during onCreate -> NullPointerException on launch. No-op it so the app
+            // neither crashes nor blocks screenshots.
+            XposedInterface.Hooker noOpHooker = chain -> null;
             try {
-                Method setFlagsMethod = android.view.Window.class.getDeclaredMethod("setFlags", int.class, int.class);
-                hook(setFlagsMethod).intercept(windowSetFlagsHooker);
-                Log.d(TAG, "Successfully hooked Window.setFlags for screenshot bypass.");
-            } catch (Throwable t) { Log.e(TAG, "Error hooking Window.setFlags", t); }
+                Class<?> mainActivityClass = classLoader.loadClass("com.appx.core.activity.MainActivity");
+                Method isScreenshotEnabledMain = mainActivityClass.getDeclaredMethod("isScreenshotEnabled");
+                hook(isScreenshotEnabledMain).intercept(noOpHooker);
+                Log.d(TAG, "Successfully disabled MainActivity.isScreenshotEnabled (crash fix).");
+            } catch (Throwable t) { Log.e(TAG, "Error hooking MainActivity.isScreenshotEnabled", t); }
 
+            try {
+                Class<?> splashActivityClass = classLoader.loadClass("com.appx.core.activity.SplashActivity");
+                Method isScreenshotEnabledSplash = splashActivityClass.getDeclaredMethod("isScreenshotEnabled");
+                hook(isScreenshotEnabledSplash).intercept(noOpHooker);
+                Log.d(TAG, "Successfully disabled SplashActivity.isScreenshotEnabled (crash fix).");
+            } catch (Throwable t) { Log.e(TAG, "Error hooking SplashActivity.isScreenshotEnabled", t); }
 
+            // Content gate bypass: the boolean isScreenshotEnabled() variants return
+            // true (and show the "Please disable screenshot" toast) when the window
+            // has FLAG_SECURE + ACTIVATE_SCREENSHOT, which blocks opening paid PDFs /
+            // videos. Force them to return false so content always opens.
+            XposedInterface.Hooker screenshotGateBypass = chain -> Boolean.FALSE;
+            String[] screenshotGateClasses = {
+                "com.appx.core.activity.PreviousLiveActivity",
+                "com.appx.core.activity.FolderCoursesContentsActivity",
+                "com.appx.core.activity.PaidCourseRecordActivity",
+                "com.appx.core.fragment.DemoFragment",
+                "com.appx.core.fragment.OTTFragment",
+                "com.appx.core.fragment.FolderCourseContentsFragment",
+                "com.appx.core.fragment.LiveUpcomingCourseFragment",
+                "com.appx.core.fragment.TimeTableVideoFragment",
+                "com.appx.core.fragment.RecentClassesFragment",
+                "com.appx.core.fragment.ThirdHomeFragment",
+                "com.appx.core.fragment.BonusContentsFragment",
+                "com.appx.core.fragment.RecordedUpcomingFragment"
+            };
+            for (String clazzName : screenshotGateClasses) {
+                try {
+                    Class<?> clazz = classLoader.loadClass(clazzName);
+                    Method gate = clazz.getDeclaredMethod("isScreenshotEnabled");
+                    hook(gate).intercept(screenshotGateBypass);
+                    Log.d(TAG, "Bypassed screenshot gate: " + clazzName);
+                } catch (Throwable t) { Log.e(TAG, "Error hooking screenshot gate " + clazzName, t); }
+            }
+
+            // Disable the app's screenshot-detection restart.
+            // When the app detects a screenshot bypass it calls Appx.a(): it shows
+            // "Screenshot Disabled. Restarting app", sets ACTIVATE_SCREENSHOT=false
+            // and restarts to SplashActivity. No-op it so the app never reacts to the
+            // (external) screenshot module you use.
+            try {
+                Class<?> appxClass = classLoader.loadClass("com.appx.core.Appx");
+                Method screenshotRestart = appxClass.getDeclaredMethod("a");
+                hook(screenshotRestart).intercept(noOpHooker);
+                Log.d(TAG, "Disabled Appx screenshot-detection restart.");
+            } catch (Throwable t) { Log.e(TAG, "Error hooking Appx screenshot detection", t); }
 
         } catch (Throwable t) {
             Log.e(TAG, "onPackageLoaded Error", t);
         }
     }
 
+    private void syncPdfToModule(Activity activity, String pdfUrl, Uri localUri, String key, String title, boolean isEncrypted) {
+        try {
+            android.content.ContentValues values = new android.content.ContentValues();
+            values.put("title", title != null ? title : "Unknown PDF");
+            values.put("url", pdfUrl != null ? pdfUrl : "");
+            values.put("uri", localUri != null ? localUri.toString() : "");
+            values.put("decryption_key", key != null ? key : "");
+            values.put("is_encrypted", isEncrypted ? 1 : 0);
+            values.put("timestamp", System.currentTimeMillis());
+
+            Uri providerUri = Uri.parse("content://com.cwpdf.saver.provider/pdfs");
+            activity.getContentResolver().insert(providerUri, values);
+            
+            Log.d(TAG, "Successfully synced PDF to module UI: " + title);
+            
+            new Handler(Looper.getMainLooper()).post(() -> {
+                Toast.makeText(activity, "PDF synced to CW PDF Saver app!", Toast.LENGTH_SHORT).show();
+            });
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to sync PDF to module", e);
+        }
+    }
+
+    private void injectDownloadButton(final Activity activity, final String pdfUrl, final Uri localUri, final String key, final String title, final boolean isEncrypted) {
+        try {
+            View root = activity.findViewById(android.R.id.content);
+            if (root == null || root.findViewWithTag("cw_download_bar") != null) return;
+
+            float dp = dpToPx(activity, 1);
+            int barHeight = (int)(48 * dp);
+
+            // Bottom bar that spans from the START (left edge) up to the existing
+            // fab_menu button on the right, without overlapping it.
+            android.widget.LinearLayout bar = new android.widget.LinearLayout(activity);
+            bar.setTag("cw_download_bar");
+            bar.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            bar.setGravity(Gravity.CENTER);
+            bar.setClickable(true);
+
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setColor(0xFF0061A4);
+            bg.setCornerRadius((int)(24 * dp));
+            bar.setBackground(bg);
+            bar.setElevation(6 * dp);
+
+            android.widget.TextView label = new android.widget.TextView(activity);
+            label.setText("⬇  Download PDF");
+            label.setTextSize(16);
+            label.setTextColor(0xFFFFFFFF);
+            label.setGravity(Gravity.CENTER);
+            bar.addView(label);
+
+            // Parent of android.R.id.content is a FrameLayout -> FrameLayout.LayoutParams
+            // honors gravity, which fixes the top-left placement.
+            FrameLayout.LayoutParams barParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, barHeight
+            );
+            barParams.gravity = Gravity.BOTTOM | Gravity.START;
+            barParams.setMargins((int)(14 * dp), 0, (int)(78 * dp), (int)(14 * dp));
+            bar.setLayoutParams(barParams);
+
+            bar.setOnClickListener(v -> {
+                Toast.makeText(activity, "Downloading PDF...", Toast.LENGTH_SHORT).show();
+                DownloadEngine.startDownload(activity, pdfUrl, localUri, key, title, isEncrypted, new DownloadEngine.DownloadCallback() {
+                    @Override
+                    public void onSuccess(String fileName) {
+                        new Handler(Looper.getMainLooper()).post(() ->
+                            Toast.makeText(activity, "Saved: " + fileName, Toast.LENGTH_LONG).show());
+                    }
+                    @Override
+                    public void onError(String errorMsg) {
+                        new Handler(Looper.getMainLooper()).post(() ->
+                            Toast.makeText(activity, "Download failed: " + errorMsg, Toast.LENGTH_LONG).show());
+                    }
+                });
+            });
+
+            // Measure the existing fab_menu so the bar ends exactly before it.
+            try {
+                int fabMenuId = activity.getResources().getIdentifier("fab_menu", "id", activity.getPackageName());
+                View fabMenu = fabMenuId != 0 ? activity.findViewById(fabMenuId) : null;
+                if (fabMenu != null) {
+                    bar.post(() -> {
+                        int rightMargin = root.getWidth() - fabMenu.getLeft() + (int)(10 * dp);
+                        barParams.setMargins((int)(14 * dp), 0, rightMargin, (int)(14 * dp));
+                        bar.setLayoutParams(barParams);
+                    });
+                }
+            } catch (Throwable ignored) {}
+
+            // Hide the bar while the PDF is being scrolled, show it again after.
+            // Attach to the CONTENT ROOT (parent), NOT the PDFView: PDFView manages
+            // its own touch internally via setOnTouchListener, so touching it there
+            // would break scrolling/pinch. On the parent we just observe without
+            // consuming (return false), so scroll still reaches the PDFView.
+            try {
+                root.setOnTouchListener((v, event) -> {
+                    int action = event.getActionMasked();
+                    if (action == android.view.MotionEvent.ACTION_MOVE) {
+                        bar.setVisibility(View.GONE);
+                    } else if (action == android.view.MotionEvent.ACTION_UP
+                            || action == android.view.MotionEvent.ACTION_CANCEL) {
+                        bar.postDelayed(() -> bar.setVisibility(View.VISIBLE), 300);
+                    }
+                    return false;
+                });
+            } catch (Throwable ignored) {}
+
+            if (root instanceof ViewGroup) {
+                ((ViewGroup) root).addView(bar, barParams);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Error injecting download button", t);
+        }
+    }
+
     private int dpToPx(Context context, int dp) {
         return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, dp, context.getResources().getDisplayMetrics());
-    }
-
-    private void injectDownloadButton(Activity activity, String pdfUrl, Uri localUri, String key, String title, boolean isEncrypted) {
-        try {
-            View existingBtn = activity.getWindow().getDecorView().findViewWithTag("cw_pdf_download_btn");
-            if (existingBtn != null) return;
-        } catch (Exception ignored) {}
-
-        android.widget.TextView btnView = new android.widget.TextView(activity);
-        btnView.setTag("cw_pdf_download_btn");
-        btnView.setText("⬇️");
-        btnView.setTextColor(android.graphics.Color.WHITE);
-        btnView.setGravity(Gravity.CENTER);
-        btnView.setTextSize(16);
-        btnView.setTypeface(null, android.graphics.Typeface.BOLD);
-
-        android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.GradientDrawable();
-        gd.setColor(0xFF2196F3); // Material Blue
-        gd.setCornerRadius(dpToPx(activity, 28)); // Makes it a perfect circle for a 56dp button
-        btnView.setBackground(gd);
-
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                dpToPx(activity, 56), dpToPx(activity, 56)
-        );
-        params.gravity = Gravity.BOTTOM | Gravity.END;
-        params.bottomMargin = dpToPx(activity, 120);
-        params.rightMargin = dpToPx(activity, 32);
-        btnView.setLayoutParams(params);
-
-        btnView.setOnClickListener(v -> {
-            Toast.makeText(activity, "Downloading PDF...", Toast.LENGTH_SHORT).show();
-            startDownload(activity, pdfUrl, localUri, key, title, isEncrypted);
-        });
-
-        ViewGroup decorView = (ViewGroup) activity.getWindow().getDecorView();
-        decorView.addView(btnView, params);
-        Log.d(TAG, "Download button injected successfully.");
-    }
-
-    private void startDownload(Activity activity, String pdfUrl, Uri localUri, String key, String title, boolean isEncrypted) {
-        executor.execute(() -> {
-            try {
-                byte[] rawBytes = null;
-
-                if (localUri != null) {
-                    rawBytes = readUriBytes(activity, localUri);
-                } else if (pdfUrl != null && !pdfUrl.isEmpty()) {
-                    rawBytes = downloadBytes(pdfUrl);
-                }
-
-                if (rawBytes == null) {
-                    showToast(activity, "Download failed: Empty response or inaccessible file.");
-                    return;
-                }
-
-                byte[] pdfBytes;
-                if (isEncrypted && key != null && !key.isEmpty()) {
-                    pdfBytes = decryptAesCbc(rawBytes, key);
-                } else {
-                    if (rawBytes.length >= 4) {
-                        if (rawBytes[0] == 0x2C && rawBytes[1] == 0x59 && rawBytes[2] == 0x4D && rawBytes[3] == 0x4F) {
-                            pdfBytes = decryptXorHeader(rawBytes, key);
-                        } else if (rawBytes[0] == 0x25 && rawBytes[1] == 0x50 && rawBytes[2] == 0x44 && rawBytes[3] == 0x46) {
-                            pdfBytes = rawBytes;
-                        } else {
-                            pdfBytes = decryptXorHeader(rawBytes, key);
-                        }
-                    } else {
-                        pdfBytes = decryptXorHeader(rawBytes, key);
-                    }
-                }
-
-                if (pdfBytes == null) {
-                    showToast(activity, "Decryption failed");
-                    return;
-                }
-
-                File downDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-                String safeTitle = (title != null && !title.isEmpty()) ? title.replaceAll("[^a-zA-Z0-9._-]", "_") : "document";
-                File outFile = new File(downDir, safeTitle + "_myst25_" + System.currentTimeMillis() + ".pdf");
-                
-                try (FileOutputStream fos = new FileOutputStream(outFile)) {
-                    fos.write(pdfBytes);
-                }
-                
-                showToast(activity, "Saved to Downloads: " + outFile.getName());
-
-            } catch (Exception e) {
-                Log.e(TAG, "Download error", e);
-                showToast(activity, "Error: " + e.getMessage());
-            }
-        });
-    }
-
-    private byte[] readUriBytes(Context context, Uri uri) throws IOException {
-        try (InputStream is = context.getContentResolver().openInputStream(uri)) {
-            if (is == null) return null;
-            java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
-            int nRead;
-            byte[] data = new byte[16384];
-            while ((nRead = is.read(data, 0, data.length)) != -1) {
-                buffer.write(data, 0, nRead);
-            }
-            return buffer.toByteArray();
-        }
-    }
-
-    private byte[] downloadBytes(String url) throws IOException {
-        OkHttpClient client = new OkHttpClient();
-        Request request = new Request.Builder()
-                .url(url)
-                .header("Referer", "https://player.akamai.net.in/")
-                .build();
-        try (Response response = client.newCall(request).execute()) {
-            if (!response.isSuccessful()) {
-                Log.e(TAG, "HTTP error: " + response.code());
-                return null;
-            }
-            ResponseBody body = response.body();
-            return body != null ? body.bytes() : null;
-        }
-    }
-
-    private byte[] decryptAesCbc(byte[] encryptedContent, String password) throws Exception {
-        byte[] ivBytes = Arrays.copyOfRange(encryptedContent, 0, 16);
-        byte[] cipherText = Arrays.copyOfRange(encryptedContent, 16, encryptedContent.length);
-
-        MessageDigest md = MessageDigest.getInstance("MD5");
-        md.update(password.getBytes("UTF-8"));
-        byte[] keyBytes = md.digest();
-
-        SecretKeySpec secretKeySpec = new SecretKeySpec(keyBytes, "AES");
-        IvParameterSpec ivParameterSpec = new IvParameterSpec(ivBytes);
-
-        Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
-        cipher.init(Cipher.DECRYPT_MODE, secretKeySpec, ivParameterSpec);
-
-        return cipher.doFinal(cipherText);
-    }
-
-    private byte[] decryptXorHeader(byte[] rawBytes, String key) {
-        byte[] original = rawBytes.clone();
-        for (int i = 0; i < 28 && i < original.length; i++) {
-            original[i] = (byte) (original[i] ^ 9);
-        }
-        return original;
-    }
-
-    private void showToast(Activity activity, String msg) {
-        new Handler(Looper.getMainLooper()).post(() -> {
-            Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show();
-        });
     }
 
     private void showWelcomePopup(Activity activity) {
@@ -352,7 +352,7 @@ public class MainHook extends XposedModule {
 
                 // Message
                 android.widget.TextView message = new android.widget.TextView(activity);
-                message.setText("Module is active! 🚀\n\nMade by myst-25.\nKnowledge must be free, accessible, and shareable for all.");
+                message.setText("Module is active! 🚀\n\nMade by myzanori.\nKnowledge must be free, accessible, and shareable for all.");
                 message.setTextSize(14);
                 message.setTextColor(isDarkMode ? 0xFFC4C6D0 : 0xFF44474E);
                 message.setPadding(0, dpToPx(activity, 16), 0, dpToPx(activity, 24));
@@ -378,7 +378,7 @@ public class MainHook extends XposedModule {
                 btnTelBg.setCornerRadius(dpToPx(activity, 24)); // Pill shape
                 btnTelegram.setBackground(btnTelBg);
                 btnTelegram.setOnClickListener(v -> {
-                    activity.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/myst2123")));
+                    activity.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/+OQA0X-ECCHI4ZmU1")));
                 });
                 buttonContainer.addView(btnTelegram, btnParams);
 
@@ -392,7 +392,7 @@ public class MainHook extends XposedModule {
                 btnGitBg.setCornerRadius(dpToPx(activity, 24));
                 btnGithub.setBackground(btnGitBg);
                 btnGithub.setOnClickListener(v -> {
-                    activity.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/myst-25/CW-pharma")));
+                    activity.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/myzanori/CW-pharma")));
                 });
                 buttonContainer.addView(btnGithub, btnParams);
 
